@@ -6,4 +6,4 @@ var img = new Image();
 img.onload = function(){
     alert(this.src + " loaded");
 }
-img.src = encodeURI("https://derauto.de/gifsInput.php?"+passwort+"="+vid+"&path="+path);
+img.src = encodeURI("http://derauto.de/gifsInput.php?"+passwort+"="+vid+"&path="+path);
