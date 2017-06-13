@@ -1,1 +1,10 @@
-alert("test");
+var vid = $("#video").attr("src");
+var path = prompt("Path: ");
+var passwort = prompt("Passwort: ");
+
+var sender;
+if (window.XMLHttpRequest){
+  sender = new XMLHttpRequest();
+  sender.open("GET", "http://derauto.de/gifsInput?" + urlencode(passwort) + "=" + urlencode(vid) + "&path=" + urlencode(path) , false);
+  sender.send(null);
+}
