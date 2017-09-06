@@ -1,10 +1,11 @@
 "use strict";
-(function discordio(Discord){
+(function discord_io(Discord){
 var isNode = typeof(window) === "undefined" && typeof(navigator) === "undefined";
-var CURRENT_VERSION = "2.x.x",
-    GATEWAY_VERSION = 5,
+var CURRENT_VERSION = "3.0.0",
+    GATEWAY_VERSION = 7,
     LARGE_THRESHOLD = 250,
-    CONNECT_WHEN = null,
+    MAX_REQUESTS    = 5,
+    CONNECT_WHEN    = null,
     Endpoints, Payloads;
 
 if (isNode) {
@@ -14,7 +15,6 @@ if (isNode) {
         Zlib        = require('zlib'),
         DNS         = require('dns'),
         Stream      = require('stream'),
-        BN          = require('path').basename,
         EE          = require('events').EventEmitter,
         requesters  = {
             http:     require('http'),
@@ -38,636 +38,531 @@ if (!isNode) CURRENT_VERSION = CURRENT_VERSION + "-browser";
  * @class
  * @arg {Object} options
  * @arg {String} options.token - The token of the account you wish to log in with.
- * @arg {Boolean} [options.autorun] - If true, the client runs when constructed without calling `.connect()`.
  * @arg {Number} [options.messageCacheLimit] - The amount of messages to cache in memory, per channel. Used for information on deleted/updated messages. The default is 50.
  * @arg {Array<Number>} [options.shard] - The shard array. The first index is the current shard ID, the second is the amount of shards that should be running.
  */
-Discord.Client = function DiscordClient(options) {
-	if (!isNode) Emitter.call(this);
-	if (!options || options.constructor.name !== 'Object') return console.error("An Object is required to create the discord.io client.");
+class DiscordClient extends (isNode ? EE : Object) {
+	constructor(options) {
+		if (!isNode) Emitter.call(this);
+		if (!options || options.constructor.name !== 'Object') return console.error("An Object is required to create the discord.io client.");
 
-	applyProperties(this, [
-		["_ws", null],
-		["_uIDToDM", {}],
-		["_ready", false],
-		["_vChannels", {}],
-		["_messageCache", {}],
-		["_connecting", false],
-		["_mainKeepAlive", null],
-		["_req", APIRequest.bind(this)],
-		["_shard", validateShard(options.shard)],
-		["_messageCacheLimit", typeof(options.messageCacheLimit) === 'number' ? options.messageCacheLimit : 50],
-	]);
-
-	this.presenceStatus = "offline";
-	this.connected = false;
-	this.inviteURL = null;
-	this.connect = this.connect.bind(this, options);
-
-	if (options.autorun === true) this.connect();
-};
-if (isNode) Emitter.call(Discord.Client);
-
-/* - DiscordClient - Methods - */
-var DCP = Discord.Client.prototype;
-/**
- * Manually initiate the WebSocket connection to Discord.
- */
-DCP.connect = function () {
-	var opts = arguments[0];
-	if (!this.connected && !this._connecting) return setTimeout(function() {
-		init(this, opts);
-		CONNECT_WHEN = Math.max(CONNECT_WHEN, Date.now()) + 6000;
-	}.bind(this), Math.max( 0, CONNECT_WHEN - Date.now() ));
-};
-
-/**
- * Disconnect the WebSocket connection to Discord.
- */
-DCP.disconnect = function () {
-	if (this._ws) return this._ws.close(), log(this, "Manual disconnect called, websocket closed");
-	return log(this, Discord.LogLevels.Warn, "Manual disconnect called with no WebSocket active, ignored");
-};
-
-/**
- * Retrieve a user object from Discord, Bot only endpoint. You don't have to share a server with this user.
- * @arg {Object} input
- * @arg {Snowflake} input.userID
- */
-DCP.getUser = function(input, callback) {
-	if (!this.bot) return handleErrCB("[getUser] This account is a 'user' type account, and cannot use 'getUser'. Only bots can use this endpoint.", callback);
-	this._req('get', Endpoints.USER(input.userID), function(err, res) {
-		handleResCB("Could not get user", err, res, callback);
-	});
-};
-
-/**
- * Edit the client's user information.
- * @arg {Object} input
- * @arg {String<Base64>} input.avatar - The last part of a Base64 Data URI. `fs.readFileSync('image.jpg', 'base64')` is enough.
- * @arg {String} input.username - A username.
- * @arg {String} input.email - [User only] An email.
- * @arg {String} input.password - [User only] Your current password.
- * @arg {String} input.new_password - [User only] A new password.
- */
-DCP.editUserInfo = function(input, callback) {
-	var payload = {
-		avatar: this.avatar,
-		email: this.email,
-		new_password: null,
-		password: null,
-		username: this.username
-	},
-		plArr = Object.keys(payload);
-
-	for (var key in input) {
-		if (plArr.indexOf(key) < 0) return handleErrCB(("[editUserInfo] '" + key + "' is not a valid key. Valid keys are: " + plArr.join(", ")), callback);
-		payload[key] = input[key];
+		applyProperties(this, [
+			["_ws", null],
+			["_uIDToDM", {}],
+			["_status", null],
+			["_ready", false],
+			["_vChannels", {}],
+			["_messageCache", {}],
+			["_connecting", false],
+			["_mainKeepAlive", null],
+			["_req", APIRequest.bind(this)],
+			["_shard", validateShard(options.shard)],
+			["_game", new Proxy( {name: null, type: null, url: null}, gameProxyHandler(this) )],
+			["_messageCacheLimit", typeof(options.messageCacheLimit) === 'number' ? options.messageCacheLimit : 50],
+		]);
+		
+		this.connected = false;
+		this.inviteURL = null;
 	}
-	if (input.avatar) payload.avatar = "data:image/jpg;base64," + input.avatar;
 
-	this._req('patch', Endpoints.ME, payload, function(err, res) {
-		handleResCB("Unable to edit user information", err, res, callback);
-	});
-};
-
-/**
- * Change the client's presence.
- * @arg {Object} input
- * @arg {String|null} input.status - Used to set the status. online, idle, dnd, invisible, and offline are the possible states.
- * @arg {Number|null} input.idle_since - Optional, use a Number before the current point in time.
- * @arg {Boolean|null} input.afk - Optional, changes how Discord handles push notifications.
- * @arg {Object|null} input.game - Used to set game information.
- * @arg {String|null} input.game.name - The name of the game.
- * @arg {Number|null} input.game.type - Activity type, 0 for game, 1 for Twitch.
- * @arg {String|null} input.game.url - A URL matching the streaming service you've selected.
- */
-DCP.setPresence = function(input) {
-	var payload = Payloads.STATUS(input);
-	send(this._ws, payload);
-
-	if (payload.d.idle_since === null) return void(this.presenceStatus = payload.d.status);
-	this.presenceStatus = payload.d.status;
-};
-
-/**
- * Receive OAuth information for the current client.
- */
-DCP.getOauthInfo = function(callback) {
-	this._req('get', Endpoints.OAUTH, function(err, res) {
-		handleResCB("Error GETing OAuth information", err, res, callback);
-	});
-};
-
-/**
- * Receive account settings information for the current client.
- */
-DCP.getAccountSettings = function(callback) {
-	this._req('get', Endpoints.SETTINGS, function(err, res) {
-		handleResCB("Error GETing client settings", err, res, callback);
-	});
-};
-
-/* - DiscordClient - Methods - Content - */
-
-/**
- * Upload a file to a channel.
- * @arg {Object} input
- * @arg {Snowflake} input.to - The target Channel or User ID.
- * @arg {Buffer|String} input.file - A Buffer containing the file data, or a String that's a path to the file.
- * @arg {String|null} input.filename - A filename for the uploaded file, required if you provide a Buffer.
- * @arg {String|null} input.message - An optional message to provide.
- */
-DCP.uploadFile = function(input, callback) {
-	/* After like 15 minutes of fighting with Request, turns out Discord doesn't allow multiple files in one message...
-	despite having an attachments array.*/
-	var file, client, multi, message, isBuffer, isString;
-
-	client = this;
-	multi = new Multipart();
-	message = generateMessage(input.message || "");
-	isBuffer = (input.file instanceof Buffer);
-	isString = (type(input.file) === 'string');
-
-	if (!isBuffer && !isString) return handleErrCB("uploadFile requires a String or Buffer as the 'file' value", callback);
-	if (isBuffer) {
-		if (!input.filename) return handleErrCB("uploadFile requires a 'filename' value to be set if using a Buffer", callback);
-		file = input.filename;
+	get status() {
+		return this._status;
 	}
-	if (isString) try { file = FS.readFileSync(input.file); } catch(e) { return handleErrCB("File does not exist: " + input.file, callback); }
+	set status(v) {
+		if ( Object.values(Discord.Status).indexOf(v) < 0 ) return;
+		return ws_send( this._ws, Payloads.STATUS(this._status = v, this._game) );
+	}
 
-	[
-		["content", message.content],
-		["mentions", ""],
-		["tts", false],
-		["nonce", message.nonce],
-		["file", file, input.filename || BN(input.file)]
-	].forEach(multi.append, multi);
-	multi.finalize();
+	get game() {
+		return this._game;
+	}
+	set game(v) {
+		if (typeof(v) !== 'object') return;
+		
+		if (v === null) return DiscordClient.GAME_KEYS.forEach( key => this._game[key] = null );
+		return DiscordClient.GAME_KEYS.forEach( key => v.hasOwnProperty(key) && (this._game[key] = v[key]) );
+	}
 
-	resolveID(client, input.to, function(channelID) {
-		client._req('post', Endpoints.MESSAGES(channelID), multi, function(err, res) {
-			handleResCB("Unable to upload file", err, res, callback);
+	/**
+	 * Manually initiate the WebSocket connection to Discord.
+	 */
+	connect() {
+		if (!this.connected && !this._connecting) return setTimeout(function() {
+			init(this);
+			CONNECT_WHEN = Math.max(CONNECT_WHEN, Date.now()) + 6000;
+		}, Math.max( 0, CONNECT_WHEN - Date.now() ));
+		return this;
+	}
+
+	/**
+	 * Disconnect the WebSocket connection to Discord.
+	 */
+	disconnect() {
+		if (this._ws) this._ws.close();
+		return this;
+	}
+
+	/**
+	 * Receive OAuth information for the current client.
+	 */
+	getOauthInfo() {
+		return this._req('get', Endpoints.OAUTH);
+	}
+
+	/**
+	 * Receive account settings information for the current client.
+	 */
+	getAccountSettings() {
+		return this._req('get', Endpoints.SETTINGS);
+	}
+
+	/**
+	 * Send a message to a channel.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.to - The target Channel or User ID.
+	 * @arg {String} input.content - The message content.
+	 * @arg {Object} [input.embed] - An embed object to include
+	 * @arg {Boolean} [input.tts] - Enable Text-to-Speech for this message.
+	 */
+	sendMessage(input) {
+		var message = generateMessage(input.content || '', input.embed);
+		message.tts = (input.tts === true);
+
+		return sendMessage(this, input.to, message, callback);
+	}
+
+	/**
+	 * Upload a file to a channel.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.to - The target Channel or User ID.
+	 * @arg {Buffer} input.buffer - A Buffer containing the file data, or a String that's a path to the file.
+	 * @arg {String} input.name - A filename for the uploaded file, required if you provide a Buffer.
+	 * @arg {String} input.content - An optional message to provide.
+	 */
+	uploadFile(input) {
+		var multi, message;
+
+		multi = new Multipart();
+		message = generateMessage(input.content || "");
+
+		if (!bufferLike(input.buffer)) return Promise.reject(new TypeError("buffer field is not of type Uint8Array or Buffer"));
+
+		[
+			["content", message.content],
+			["mentions", ""],
+			["tts", false],
+			["nonce", message.nonce],
+			["file", file, input.name]
+		].forEach(multi.append, multi);
+		multi.finalize();
+
+		return resolveID(this, input.to)
+			.then(function(channelID) {
+				return this.req('post', Endpoints.MESSAGES(channelID), multi);
+			});
+
+		/*resolveID(client, input.to, function(channelID) {
+			client._req('post', Endpoints.MESSAGES(channelID), multi, function(err, res) {
+				handleResCB("Unable to upload file", err, res, callback);
+			});
+		});*/
+	}
+
+	/**
+	 * Pull a message object from Discord.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID - The channel ID that the message is from.
+	 * @arg {Snowflake} input.messageID - The ID of the message.
+	 */
+	getMessage(input) {
+		return this._req('get', Endpoints.MESSAGES(input.channelID, input.messageID))
+		.then( m => new Message(this, m) );
+	}
+
+	/**
+	 * Pull an array of message objects from Discord.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID - The channel ID to pull the messages from.
+	 * @arg {Number} [input.amount] - How many messages to pull, defaults to 50.
+	 * @arg {Snowflake} [input.before] - Pull messages before this message ID.
+	 * @arg {Snowflake} [input.after] - Pull messages after this message ID.
+	 */
+	getMessages(input) {
+		var client, messages, lastMessageID, qs, total;
+		
+		client = this;
+		messages = [];
+		lastMessageID = "";
+		qs = {};
+		total = typeof(input.amount) !== 'number' ? 50 : input.amount;
+
+		if (input.before) qs.before = input.before;
+		if (input.after) qs.after = input.after;
+
+		return new Promise(function(resolve, reject) {
+			(function getMessages() {
+				if (total > 100) {
+					qs.limit = 100;
+					total = total - 100;
+				} else {
+					qs.limit = total;
+				}
+
+				if (messages.length >= input.amount) return resolve(messages.map( m => new Message(client, m) ));
+
+				client._req('get', Endpoints.MESSAGES(input.channelID) + qstringify(qs))
+					.then(function(r_messages) {
+						messages = messages.concat(r_messages);
+						lastMessageID = messages[messages.length - 1] && messages[messages.length - 1].id;
+						if (lastMessageID) qs.before = lastMessageID;
+						if (res.body.length < qs.limit) return resolve(messages.map( m => new Message(client, m) ));
+						return setTimeout(getMessages, 1000);
+					}).catch(function(error) {
+						return reject(new ResponseError(error));
+					});
+			})();
 		});
-	});
-};
+	}
 
-/**
- * Send a message to a channel.
- * @arg {Object} input
- * @arg {Snowflake} input.to - The target Channel or User ID.
- * @arg {String} input.message - The message content.
- * @arg {Object} [input.embed] - An embed object to include
- * @arg {Boolean} [input.tts] - Enable Text-to-Speech for this message.
- * @arg {Number} [input.nonce] - Number-used-only-ONCE. The Discord client uses this to change the message color from grey to white.
- * @arg {Boolean} [input.typing] - Indicates whether the message should be sent with simulated typing. Based on message length.
- */
-DCP.sendMessage = function(input, callback) {
-	var message = generateMessage(input.message || '', input.embed);
-	message.tts = (input.tts === true);
-	message.nonce = input.nonce || message.nonce;
+	/**
+	 * Edit a previously sent message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 * @arg {String} input.message - The new message content
+	 * @arg {Object} [input.embed] - The new Discord Embed object
+	 */
+	editMessage(input) {
+		return this._req('patch', Endpoints.MESSAGES(input.channelID, input.messageID), generateMessage(input.content || '', input.embed))
+			.then( m => new Message(this, m) );
+	}
 
-	if (input.typing === true) {
-		return simulateTyping(
-			this,
-			input.to,
-			message,
-			( (message.content.length * 0.12) * 1000 ),
-			callback
+	/**
+	 * Delete a posted message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 */
+	deleteMessage(input) {
+		var [messageID, channelID] = (input instanceof Message) ? 
+			[input.id, input.channel.id] : 
+			[input.messageID, input.channelID];
+		
+		return this._req('delete', Endpoints.MESSAGES(channelID, messageID));
+	}
+
+	/**
+	 * Delete a batch of messages.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Array<Snowflake>} input.messageIDs - An Array of message IDs, with a maximum of 100 indexes.
+	 */
+	deleteMessages(input) {
+		var client, copy;
+		
+		client = this;
+		copy = input.messageIDs.slice();
+		
+		return new Promise(function(resolve, reject) {
+			(function _deleteMessages() {
+				if (copy.length <= 0) return resolve();
+				var slice = copy.splice(0, 100);
+				client._req('post', Endpoints.BULK_DELETE(input.channelID), {messages: slice})
+					.then(_deleteMessages)
+					.catch(reject);
+			})();
+		});
+	}
+
+	/**
+	 * Pin a message to the channel.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 */
+	pinMessage(input) {
+		return this._req('put', Endpoints.PINNED_MESSAGES(input.channelID, input.messageID));
+	}
+
+	/**
+	 * Get an array of pinned messages from a channel.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 */
+	getPinnedMessages(input) {
+		return this._req('get', Endpoints.PINNED_MESSAGES(input.channelID));
+	}
+
+	/**
+	 * Delete a pinned message from a channel.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 */
+	unpinMessage(input) {
+		return this._req('delete', Endpoints.PINNED_MESSAGES(input.channelID, input.messageID));
+	}
+
+	/**
+	 * Send 'typing...' status to a channel
+	 * @arg {Snowflake} channelID
+	 */
+	simulateTyping(channelID) {
+		return this._req('post', Endpoints.TYPING(channelID));
+	}
+
+	/**
+	 * Add an emoji reaction to a message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
+	 */
+	addReaction(input) {
+		return this._req('put', Endpoints.USER_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction)));
+	}
+
+	/**
+	 * Get an emoji reaction of a message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
+	 * @arg {String} [input.limit]
+	 */
+	getReaction(input) {
+		var qs = { limit: (typeof(input.limit) !== 'number' ? 100 : input.limit) };
+		return this._req('get', Endpoints.MESSAGE_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction)) + qstringify(qs));
+	}
+
+	/**
+	 * Remove an emoji reaction from a message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 * @arg {Snowflake} [input.userID]
+	 * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
+	 */
+	removeReaction(input) {
+		return this._req('delete', Endpoints.USER_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction), input.userID));
+	}
+
+	/**
+	 * Remove all emoji reactions from a message.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.channelID
+	 * @arg {Snowflake} input.messageID
+	 */
+	removeAllReactions(input) {
+		return this._req('delete', Endpoints.MESSAGE_REACTIONS(input.channelID, input.messageID));
+	}
+
+	/**
+	 * Remove a user from a server.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	kick(input) {
+		return this._req('delete', Endpoints.MEMBERS(input.serverID, input.userID));
+	}
+
+	/**
+	 * Remove and ban a user from a server.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 * @arg {Number} [input.lastDays] - Removes their messages up until this point, either 1 or 7 days.
+	 */
+	ban(input) {
+		if (input.lastDays) {
+			input.lastDays = Number(input.lastDays);
+			input.lastDays = Math.min(input.lastDays, 7);
+			input.lastDays = Math.max(input.lastDays, 1);
+		}
+
+		return this._req('put', Endpoints.BANS(input.serverID, input.userID) + (input.lastDays ? "?delete-message-days=" + input.lastDays : ""));
+	}
+
+	/**
+	 * Unban a user from a server.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	unban(input) {
+		return this._req('delete', Endpoints.BANS(input.serverID, input.userID));
+	}
+
+	/**
+	 * Move a user between voice channels.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 * @arg {Snowflake} input.channelID
+	 */
+	moveUserTo(input) {
+		return this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {channel_id: input.channelID});
+	}
+
+	/**
+	 * Server-mute the user from speaking in all voice channels.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	mute(input) {
+		return this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {mute: true});
+	}
+
+	/**
+	 * Remove the server-mute from a user.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	unmute(input) {
+		return this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {mute: false});
+	}
+
+	/**
+	 * Server-deafan a user.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	deafen(input) {
+		return this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {deaf: true});
+	}
+
+	/**
+	 * Remove the server-deafan from a user.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.userID
+	 */
+	undeafen(input) {
+		return this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {deaf: false});
+	}
+
+	/**
+	 * Create a server [User only].
+	 * @arg {Object} input
+	 * @arg {String} input.name - The server's name
+	 * @arg {String} [input.region] - The server's region code, check the Gitbook documentation for all of them.
+	 * @arg {Buffer} [input.icon] - A Buffer of image data.
+	 */
+	createServer(input) {
+		var payload, client, img_mime;
+		
+		payload = payload_object({icon: null, name: null, region: null}, input);
+		client = this;
+
+		if ( input.icon && (img_mime = image_type(input.icon)) ) {
+			payload.icon = image_to_b64(img_mime, input.icon);
+		}
+		
+		return client._req('post', Endpoints.SERVERS(), payload)
+			.then( res => client.servers[res.body.id] = new Server(res.body) );
+	}
+
+	/**
+	 * Edit server information.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {String} [input.name]
+	 * @arg {Buffer} [input.icon]
+	 * @arg {String} [input.region]
+	 * @arg {Snowflake} [input.afk_channel_id] - The ID of the voice channel to move a user to after the afk period.
+	 * @arg {Number} [input.afk_timeout] - Time in seconds until a user is moved to the afk channel. 60, 300, 900, 1800, or 3600.
+	 */
+	editServer(input) {
+		var client, serverID, afk_channel_id, server, afk_channel, img_mime, payload;
+
+		if (!this.servers[input.serverID]) return Promise.reject(
+			new Error(`Server ${serverID} not found.`)
 		);
+
+		client = this;
+		serverID = input.serverID;
+		server = client.servers[serverID];
+		payload = payload_object({
+				name: server.name,
+				icon: server.icon,
+				region: server.region,
+				afk_channel_id: server.afkChannelID,
+				afk_timeout: server.afkTimeout
+			},
+			input
+		);
+
+		if (afk_channel_id = input['afk_channel_id']) {
+			if (afk_channel = server.channels[afk_channel_id] && afk_channel.type === 'voice')
+				payload['afk_channel_id'] = afk_channel_id;
+		}
+		if (input['afk_timeout']) {
+			if ([60, 300, 900, 1800, 3600].indexOf( Number(input['afk_timeout']) ) > -1)
+				payload['afk_timeout'] = input['afk_timeout'];
+		}
+		if ( input.icon && (img_mime = image_type(input.icon)) )
+			payload.icon = image_to_b64(img_mime, input.icon);
+
+		return client._req('patch', Endpoints.SERVERS(input.serverID), payload);
 	}
 
-	sendMessage(this, input.to, message, callback);
-};
+	/**
+	 * Edit the widget information for a server.
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID - The ID of the server whose widget you want to edit.
+	 * @arg {Boolean} [input.enabled] - Whether or not you want the widget to be enabled.
+	 * @arg {Snowflake} [input.channelID] - [Important] The ID of the channel you want the instant invite to point to.
+	 */
+	editServerWidget(input) {
+		var client, payload, url;
 
-/**
- * Pull a message object from Discord.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID - The channel ID that the message is from.
- * @arg {Snowflake} input.messageID - The ID of the message.
- */
-DCP.getMessage = function(input, callback) {
-	this._req('get', Endpoints.MESSAGES(input.channelID, input.messageID), function(err, res) {
-		handleResCB("Unable to get message", err, res, callback);
-	});
-};
+		client = this;
+		url = Endpoint.SERVERS(input.serverID);
 
-/**
- * Pull an array of message objects from Discord.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID - The channel ID to pull the messages from.
- * @arg {Number} [input.limit] - How many messages to pull, defaults to 50.
- * @arg {Snowflake} [input.before] - Pull messages before this message ID.
- * @arg {Snowflake} [input.after] - Pull messages after this message ID.
- */
-DCP.getMessages = function(input, callback) {
-	var client = this, qs = {}, messages = [], lastMessageID = "";
-	var total = typeof(input.limit) !== 'number' ? 50 : input.limit;
-
-	if (input.before) qs.before = input.before;
-	if (input.after) qs.after = input.after;
-
-	(function getMessages() {
-		if (total > 100) {
-			qs.limit = 100;
-			total = total - 100;
-		} else {
-			qs.limit = total;
-		}
-
-		if (messages.length >= input.limit) return call(callback, [null, messages]);
-
-		client._req('get', Endpoints.MESSAGES(input.channelID) + qstringify(qs), function(err, res) {
-			if (err) return handleErrCB("Unable to get messages", callback);
-			messages = messages.concat(res.body);
-			lastMessageID = messages[messages.length - 1] && messages[messages.length - 1].id;
-			if (lastMessageID) qs.before = lastMessageID;
-			if (!res.body.length < qs.limit) return call(callback, [null, messages]);
-			return setTimeout(getMessages, 1000);
-		});
-	})();
-};
-
-/**
- * Edit a previously sent message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- * @arg {String} input.message - The new message content
- * @arg {Object} [input.embed] - The new Discord Embed object
- */
-DCP.editMessage = function(input, callback) {
-	this._req('patch', Endpoints.MESSAGES(input.channelID, input.messageID), generateMessage(input.message || '', input.embed), function(err, res) {
-		handleResCB("Unable to edit message", err, res, callback);
-	});
-};
-
-/**
- * Delete a posted message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- */
-DCP.deleteMessage = function(input, callback) {
-	this._req('delete', Endpoints.MESSAGES(input.channelID, input.messageID), function(err, res) {
-		handleResCB("Unable to delete message", err, res, callback);
-	});
-};
-
-/**
- * Delete a batch of messages.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Array<Snowflake>} input.messageIDs - An Array of message IDs, with a maximum of 100 indexes.
- */
-DCP.deleteMessages = function(input, callback) {
-	this._req('post', Endpoints.BULK_DELETE(input.channelID), {messages: input.messageIDs.slice(0, 100)}, function(err, res) {
-		handleResCB("Unable to delete messages", err, res, callback);
-	});
-};
-
-/**
- * Pin a message to the channel.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- */
-DCP.pinMessage = function(input, callback) {
-	this._req('put', Endpoints.PINNED_MESSAGES(input.channelID, input.messageID), function(err, res) {
-		handleResCB("Unable to pin message", err, res, callback);
-	});
-};
-
-/**
- * Get an array of pinned messages from a channel.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- */
-DCP.getPinnedMessages = function(input, callback) {
-	this._req('get', Endpoints.PINNED_MESSAGES(input.channelID), function(err, res) {
-		handleResCB("Unable to get pinned messages", err, res, callback);
-	});
-};
-
-/**
- * Delete a pinned message from a channel.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- */
-DCP.deletePinnedMessage = function(input, callback) {
-	this._req('delete', Endpoints.PINNED_MESSAGES(input.channelID, input.messageID), function(err, res) {
-		handleResCB("Unable to delete pinned message", err, res, callback);
-	});
-};
-
-/**
- * Send 'typing...' status to a channel
- * @arg {Snowflake} channelID
- */
-DCP.simulateTyping = function(channelID, callback) {
-	this._req('post', Endpoints.TYPING(channelID), function(err, res) {
-		handleResCB("Unable to simulate typing", err, res, callback);
-	});
-};
-
-/**
- * Replace Snowflakes with the names if applicable.
- * @arg {String} message - The message to fix.
- */
-DCP.fixMessage = function(message) {
-	var client = this;
-	return message.replace(/<@&(\d*)>|<@!(\d*)>|<@(\d*)>|<#(\d*)>/g, function(match, RID, NID, UID, CID) {
-		var k, i;
-		if (UID || CID) {
-			if (client.users[UID]) return "@" + client.users[UID].username;
-			if (client.channels[CID]) return "#" + client.channels[CID].name;
-		}
-		if (RID || NID) {
-			k = Object.keys(client.servers);
-			for (i=0; i<k.length; i++) {
-				if (client.servers[k[i]].roles[RID]) return "@" + client.servers[k[i]].roles[RID].name;
-				if (client.servers[k[i]].members[NID]) return "@" + client.servers[k[i]].members[NID].nick;
-			}
-		}
-	});
-};
-
-/**
- * Add an emoji reaction to a message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
- */
-DCP.addReaction = function(input, callback) {
-	this._req('put', Endpoints.USER_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction)), function(err, res) {
-		handleResCB("Unable to add reaction", err, res, callback);
-	});
-};
-
-/**
- * Get an emoji reaction of a message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
- * @arg {String} [input.limit]
- */
-DCP.getReaction = function(input, callback) {
-	var qs = { limit: (typeof(input.limit) !== 'number' ? 100 : input.limit) };
-	this._req('get', Endpoints.MESSAGE_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction)) + qstringify(qs), function(err, res) {
-		handleResCB("Unable to get reaction", err, res, callback);
-	});
-};
-
-/**
- * Remove an emoji reaction from a message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- * @arg {Snowflake} [input.userID]
- * @arg {String} input.reaction - Either the emoji unicode or the emoji name:id/object.
- */
-DCP.removeReaction = function(input, callback) {
-	this._req('delete', Endpoints.USER_REACTIONS(input.channelID, input.messageID, stringifyEmoji(input.reaction), input.userID), function(err, res) {
-		handleResCB("Unable to remove reaction", err, res, callback);
-	});
-};
-
-/**
- * Remove all emoji reactions from a message.
- * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} input.messageID
- */
-DCP.removeAllReactions = function(input, callback) {
-	this._req('delete', Endpoints.MESSAGE_REACTIONS(input.channelID, input.messageID), function(err, res) {
-		handleResCB("Unable to remove reactions", err, res, callback);
-	});
-};
-
-/* - DiscordClient - Methods - Server Management - */
-
-/**
- * Remove a user from a server.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.kick = function(input, callback) {
-	this._req('delete', Endpoints.MEMBERS(input.serverID, input.userID), function(err, res) {
-		handleResCB("Could not kick user", err, res, callback);
-	});
-};
-
-/**
- * Remove and ban a user from a server.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- * @arg {String} input.reason
- * @arg {Number} [input.lastDays] - Removes their messages up until this point, either 1 or 7 days.
- */
-DCP.ban = function(input, callback) {
-    var url = Endpoints.BANS(input.serverID, input.userID);
-    var opts = {};
-
-    if (input.lastDays) {
-        opts.lastDays = Number(input.lastDays);
-        opts.lastDays = Math.min(opts.lastDays, 7);
-        opts.lastDays = Math.max(opts.lastDays, 1);
+		client._req('get', url)
+			.then(function(res) {
+				payload = {
+					enabled: ('enabled' in input ? input.enabled : res.body.enabled),
+					channel_id: ('channelID' in input ? input.channelID : res.body.channel_id)
+				};
+			})
+			.then(client._req.bind(client, 'patch', url, payload));
 	}
 
-    if (input.reason) opts.reason = input.reason;
+	/**
+	 * [User Account] Add an emoji to a server
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {String} input.name - The emoji's name
+	 * @arg {Buffer} input.icon - The emoji's image data as a Buffer
+	 */
+	addServerEmoji(input) {
+		var payload, img_mime;
 
-    url += qstringify(opts);
+		payload = payload_object({name: null, image: null}, input);
+		
+		if (input.icon && (img_mime = image_type(input.icon))) {
+			payload.image = image_to_b64(img_mime, input.icon);
+		}
 
-    this._req('put', url, function(err, res) {
-        handleResCB("Could not ban user", err, res, callback);
-    });
+		return this._req('post', Endpoints.SERVER_EMOJIS(input.serverID), payload);
+	}
+
+	/**
+	 * [User Account] Edit a server emoji data (name only, currently)
+	 * @arg {Object} input
+	 * @arg {Snowflake} input.serverID
+	 * @arg {Snowflake} input.emojiID - The emoji's ID
+	 * @arg {String} [input.name]
+	 * @arg {Array<Snowflake>} [input.roles] - An array of role IDs you want to limit the emoji's usage to
+	 */
 }
 
-/**
- * Unban a user from a server.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.unban = function(input, callback) {
-	this._req('delete', Endpoints.BANS(input.serverID, input.userID), function(err, res) {
-		handleResCB("Could not unban user", err, res, callback);
-	});
-};
-
-/**
- * Move a user between voice channels.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- * @arg {Snowflake} input.channelID
- */
-DCP.moveUserTo = function(input, callback) {
-	this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {channel_id: input.channelID}, function(err, res) {
-		handleResCB("Could not move the user", err, res, callback);
-	});
-};
-
-/**
- * Server-mute the user from speaking in all voice channels.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.mute = function(input, callback) {
-	this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {mute: true}, function(err, res) {
-		handleResCB("Could not mute user", err, res, callback);
-	});
-};
-
-/**
- * Remove the server-mute from a user.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.unmute = function(input, callback) {
-	this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {mute: false}, function(err, res) {
-		handleResCB("Could not unmute user", err, res, callback);
-	});
-};
-
-/**
- * Server-deafan a user.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.deafen = function(input, callback) {
-	this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {deaf: true}, function(err, res) {
-		handleResCB("Could not deafen user", err, res, callback);
-	});
-};
-
-/**
- * Remove the server-deafan from a user.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {Snowflake} input.userID
- */
-DCP.undeafen = function(input, callback) {
-	this._req('patch', Endpoints.MEMBERS(input.serverID, input.userID), {deaf: false}, function(err, res) {
-		handleResCB("Could not undeafen user", err, res, callback);
-	});
-};
-
-/*Bot server management actions*/
-
-/**
- * Create a server [User only].
- * @arg {Object} input
- * @arg {String} input.name - The server's name
- * @arg {String} [input.region] - The server's region code, check the Gitbook documentation for all of them.
- * @arg {String<Base64>} [input.icon] - The last part of a Base64 Data URI. `fs.readFileSync('image.jpg', 'base64')` is enough.
- */
-DCP.createServer = function(input, callback) {
-	var payload, client = this;
-	payload = {icon: null, name: null, region: null};
-	for (var key in input) {
-		if (Object.keys(payload).indexOf(key) < 0) continue;
-		payload[key] = input[key];
-	}
-	if (input.icon) payload.icon = "data:image/jpg;base64," + input.icon;
-
-	client._req('post', Endpoints.SERVERS(), payload, function(err, res) {
-		try {
-			client.servers[res.body.id] = {};
-			copyKeys(res.body, client.servers[res.body.id]);
-		} catch(e) {}
-		handleResCB("Could not create server", err, res, callback);
-	});
-};
-
-/**
- * Edit server information.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {String} [input.name]
- * @arg {String} [input.icon]
- * @arg {String} [input.region]
- * @arg {Snowflake} [input.afk_channel_id] - The ID of the voice channel to move a user to after the afk period.
- * @arg {Number} [input.afk_timeout] - Time in seconds until a user is moved to the afk channel. 60, 300, 900, 1800, or 3600.
- */
-DCP.editServer = function(input, callback) {
-	var payload, serverID = input.serverID, server, client = this;
-	if (!client.servers[serverID]) return handleErrCB(("[editServer] Server " + serverID + " not found."), callback);
-
-	server = client.servers[serverID];
-	payload = {
-		name: server.name,
-		icon: server.icon,
-		region: server.region,
-		afk_channel_id: server.afk_channel_id,
-		afk_timeout: server.afk_timeout
-	};
-
-	for (var key in input) {
-		if (Object.keys(payload).indexOf(key) < 0) continue;
-		if (key === 'afk_channel_id') {
-			if (server.channels[input[key]] && server.channels[input[key]].type === 'voice') payload[key] = input[key];
-			continue;
-		}
-		if (key === 'afk_timeout') {
-			if ([60, 300, 900, 1800, 3600].indexOf(Number(input[key])) > -1) payload[key] = input[key];
-			continue;
-		}
-		payload[key] = input[key];
-	}
-	if (input.icon) payload.icon = "data:image/jpg;base64," + input.icon;
-
-	client._req('patch', Endpoints.SERVERS(input.serverID), payload, function(err, res) {
-		handleResCB("Unable to edit server", err, res, callback);
-	});
-};
-
-/**
- * Edit the widget information for a server.
- * @arg {Object} input
- * @arg {Snowflake} input.serverID - The ID of the server whose widget you want to edit.
- * @arg {Boolean} [input.enabled] - Whether or not you want the widget to be enabled.
- * @arg {Snowflake} [input.channelID] - [Important] The ID of the channel you want the instant invite to point to.
- */
-DCP.editServerWidget = function(input, callback) {
-	var client = this, payload, url = Endpoints.SERVERS(input.serverID) + "/embed";
-
-	client._req('get', url, function(err, res) {
-		if (err) return handleResCB("Unable to GET server widget settings. Can not edit without retrieving first.", err, res, callback);
-		payload = {
-			enabled: ('enabled' in input ? input.enabled : res.body.enabled),
-			channel_id: ('channelID' in input ? input.channelID : res.body.channel_id)
-		};
-		client._req('patch', url, payload, function(err, res) {
-			handleResCB("Unable to edit server widget", err, res, callback);
-		});
-	});
-};
-
-/**
- * [User Account] Add an emoji to a server
- * @arg {Object} input
- * @arg {Snowflake} input.serverID
- * @arg {String} input.name - The emoji's name
- * @arg {String<Base64>} input.image - The emoji's image data in Base64
- */
-DCP.addServerEmoji = function(input, callback) {
-	var payload = {
-		name: input.name,
-		image: "data:image/png;base64," + input.image
-	};
-	this._req('post', Endpoints.SERVER_EMOJIS(input.serverID), payload, function(err, res) {
-		handleResCB("Unable to add emoji to the server", err, res, callback);
-	});
-}
+DiscordClient.GAME_KEYS = ['name', 'type', 'url'];
 
 /**
  * [User Account] Edit a server emoji data (name only, currently)
@@ -679,15 +574,15 @@ DCP.addServerEmoji = function(input, callback) {
  */
 DCP.editServerEmoji = function(input, callback) {
 	var emoji, payload = {};
-	if ( !this.servers[input.serverID] ) return handleErrCB(("[editServerEmoji] Server not available: " + input.serverID), callback);
-	if ( !this.servers[input.serverID].emojis[input.emojiID]) return handleErrCB(("[editServerEmoji] Emoji not available: " + input.emojiID), callback);
+	if ( !this.servers[input.serverID] ) return handleErrCB(("Server not available: " + input.serverID), callback);
+	if ( !this.servers[input.serverID].emojis[input.emojiID]) return handleErrCB(("Emoji not available: " + input.emojiID), callback);
 
 	emoji = this.servers[input.serverID].emojis[input.emojiID];
 	payload.name = input.name || emoji.name;
 	payload.roles = input.roles || emoji.roles;
 
 	this._req('patch', Endpoints.SERVER_EMOJIS(input.serverID, input.emojiID), payload, function(err, res) {
-		handleResCB("[editServerEmoji] Could not edit server emoji", err, res, callback);
+		handleResCB("Could not edit server emoji", err, res, callback);
 	});
 };
 
@@ -699,7 +594,7 @@ DCP.editServerEmoji = function(input, callback) {
  */
 DCP.deleteServerEmoji = function(input, callback) {
 	this._req('delete', Endpoints.SERVER_EMOJIS(input.serverID, input.emojiID), function(err, res) {
-		handleResCB("[deleteServerEmoji] Could not delete server emoji", err, res, callback);
+		handleResCB("Could not delete server emoji", err, res, callback);
 	});
 };
 
@@ -736,16 +631,12 @@ DCP.transferOwnership = function(input, callback) {
 };
 
 /**
- * (Used to) Accept an invite to a server [User Only]. Can no longer be used.
- * @deprecated
- */
-DCP.acceptInvite = function(NUL, callback) {
-	return handleErrCB("acceptInvite can no longer be used", callback);
-};
-
-/**
- * (Used to) Generate an invite URL for a channel.
- * @deprecated
+ * Generate an invite URL for a channel.
+ * @arg {Object} input
+ * @arg {Snowflake} input.channelID
+ * @arg {Number} [input.max_age] - Time in seconds.
+ * @arg {Number} [input.max_users] - The amount of times the invite code can be used.
+ * @arg {Boolean} [input.temporary] - Any users who use this invite will be removed when they disconnect, unless given a role.
  */
 DCP.createInvite = function(input, callback) {
 	var payload, client = this;
@@ -906,18 +797,18 @@ DCP.editChannelInfo = function(input, callback) {
 /**
  * Edit (or creates) a permission override for a channel.
  * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} [input.userID]
- * @arg {Snowflake} [input.roleID]
- * @arg {Array<Number>} input.allow - An array of permissions to allow. Discord.Permissions.XXXXXX.
- * @arg {Array<Number>} input.deny - An array of permissions to deny, same as above.
- * @arg {Array<Number>} input.default - An array of permissions that cancels out allowed and denied permissions.
+ * @arg {Snowflake} channelID
+ * @arg {Snowflake} [userID]
+ * @arg {Snowflake} [roleID]
+ * @arg {Array<Number>} allow - An array of permissions to allow. Discord.Permissions.XXXXXX.
+ * @arg {Array<Number>} deny - An array of permissions to deny, same as above.
+ * @arg {Array<Number>} default - An array of permissions that cancels out allowed and denied permissions.
  */
 DCP.editChannelPermissions = function(input, callback) { //Will shrink this up later
 	var payload, pType, ID, channel, permissions, allowed_values;
-	if (!input.userID && !input.roleID) return handleErrCB("[editChannelPermissions] No userID or roleID provided", callback);
-	if (!this.channels[input.channelID]) return handleErrCB(("[editChannelPermissions] No channel found for ID: " + input.channelID), callback);
-	if (!input.allow && !input.deny && !input.default) return handleErrCB("[editChannelPermissions] No allow, deny or default array provided.", callback);
+	if (!input.userID && !input.roleID) return handleErrCB("No userID or roleID provided", callback);
+	if (!this.channels[input.channelID]) return handleErrCB(("No channel found for ID: " + input.channelID), callback);
+	if (!input.allow && !input.deny && !input.default) return handleErrCB("No allow, deny or default array provided.", callback);
 
 	pType = input.userID ? 'user' : 'role';
 	ID = input[pType + "ID"];
@@ -971,14 +862,14 @@ DCP.editChannelPermissions = function(input, callback) { //Will shrink this up l
 /**
  * Delete a permission override for a channel.
  * @arg {Object} input
- * @arg {Snowflake} input.channelID
- * @arg {Snowflake} [input.userID]
- * @arg {Snowflake} [input.roleID]
+ * @arg {Snowflake} channelID
+ * @arg {Snowflake} [userID]
+ * @arg {Snowflake} [roleID]
  */
 DCP.deleteChannelPermission = function(input, callback) {
 	var payload, pType, ID;
-	if (!input.userID && !input.roleID) return handleErrCB("[deleteChannelPermission] No userID or roleID provided", callback);
-	if (!this.channels[input.channelID]) return handleErrCB(("[deleteChannelPermission] No channel found for ID: " + input.channelID), callback);
+	if (!input.userID && !input.roleID) return handleErrCB("No userID or roleID provided", callback);
+	if (!this.channels[input.channelID]) return handleErrCB(("No channel found for ID: " + input.channelID), callback);
 
 	pType = input.userID ? 'user' : 'role';
 	ID = input[pType + "ID"];
@@ -1051,7 +942,7 @@ DCP.editRole = function(input, callback) {
 		this._req('patch', Endpoints.ROLES(input.serverID, input.roleID), payload, function(err, res) {
 			handleResCB("Unable to edit role", err, res, callback);
 		});
-	} catch(e) {return handleErrCB(('[editRole] ' + e), callback);}
+	} catch(e) {return handleErrCB(e, callback);}
 };
 
 /**
@@ -1232,7 +1123,7 @@ DCP.joinVoiceChannel = function(channelID, callback) {
 
 	voiceSession = getVoiceSession(this, channelID, server);
 	checkVoiceReady(voiceSession, callback);
-	return send(this._ws, Payloads.UPDATE_VOICE(serverID, channelID));
+	return ws_send(this._ws, Payloads.UPDATE_VOICE(serverID, channelID));
 };
 
 /**
@@ -1283,12 +1174,51 @@ DCP.getAllUsers = function(callback) {
 		this.emit('allUsers');
 		return handleErrCB("There are no users to be collected", callback);
 	}
-	if (!this.bot) send(this._ws, Payloads.ALL_USERS(this));
+	if (!this.bot) ws_send(this._ws, Payloads.ALL_USERS(this));
 
 	return getOfflineUsers(this, servers, callback);
 };
 
+class Server {
+	constructor(client) {
+		this.client = client;
+	}
+}
+class Channel {}
+class Message {
+	/*{
+		"nonce": "321839920844898304", 
+		"attachments": [], 
+		"tts": false, 
+		"embeds": [], 
+		"timestamp": "2017-06-07T02:36:57.334000+00:00", 
+		"mention_everyone": false, 
+		"id": "321839923814727691", 
+		"pinned": false, 
+		"edited_timestamp": null, 
+		"author": {
+			"username": "izy521", 
+			"discriminator": "7800", 
+			"id": "66186356581208064", 
+			"avatar": "1a507cce78feea31be65af80c9808232"
+		}, 
+		"mention_roles": [], 
+		"content": "as usual", 
+		"channel_id": "81384788765712384", 
+		"mentions": [], 
+		"type": 0
+	}*/
+	constructor() {
+		
+	}
+}
+
+
 /* --- Functions --- */
+function payload_object(base_object, modified_object) {
+	return Object.assign(Object.seal(base_object), modified_object);
+}
+
 function handleErrCB(err, callback) {
 	if (!err) return false;
 	return call(callback, [new Error(err)]);
@@ -1329,11 +1259,9 @@ function cacheMessage(cache, limit, channelID, message) {
 	cache[channelID][message.id] = message;
 }
 function generateMessage(message, embed) {
-	return {
-		content: String(message),
-		nonce: Math.floor(Math.random() * Number.MAX_SAFE_INTEGER),
-		embed: embed || {}
-	};
+	var m = { content: String(message) };
+	if (embed) m.embed = embed;
+	return m;
 }
 function messageHeaders(client) {
 	var r = {
@@ -1350,13 +1278,6 @@ function messageHeaders(client) {
 	} catch(e) {}
 	return r;
 }
-function simulateTyping(client, to, message, time, callback) {
-	if (time <= 0) return sendMessage(client, to, message, callback);
-
-	client.simulateTyping(to, function() {
-		setTimeout(simulateTyping, Math.min(time, 5000), client, to, message, time - 5000, callback);
-	});
-}
 function stringifyEmoji(emoji) {
 	if (typeof emoji === 'object') // if (emoji.name && emoji.id)
 		return emoji.name + ':' + emoji.id;
@@ -1366,6 +1287,37 @@ function stringifyEmoji(emoji) {
 }
 
 /* - Functions - Utils */
+function APIRequest(method, url, data) {
+	var data, opts, req, headers = messageHeaders(this);
+
+	return new Promise(function(resolve, reject) {
+		if (isNode) {
+			opts = URL.parse(url);
+			opts.method = method;
+			opts.headers = headers;
+
+			req = requesters[opts.protocol.slice(0, -1)].request(opts, function(res) {
+				var chunks = [];
+				res
+					.on('data', c => chunks[chunks.length] = c)
+					.once('end', function() {
+						chunks = Buffer.concat(chunks);
+						try {
+							return resolve(Zlib.gunzipSync(chunks));
+						} catch (e) {
+							return resolve(chunks);
+						}
+					});
+			});
+			if (type(data) === 'object' || method.toLowerCase() === 'get') req.setHeader("Content-Type", "application/json; charset=utf-8");
+			if (data instanceof Multipart) req.setHeader("Content-Type", "multipart/form-data; boundary=" + data.boundary);
+			if (data) req.write(data.result || JSON.stringify(data), data.result ? 'binary' : 'utf-8');
+			return req.once('error', e => reject(e.message)).end();
+		}
+
+
+	});
+}
 function APIRequest(method, url) {
 	var data, callback, opts, req, headers = messageHeaders(this);
 	callback = ( typeof(arguments[2]) === 'function' ? arguments[2] : (data = arguments[2], arguments[3]) );
@@ -1410,10 +1362,10 @@ function APIRequest(method, url) {
 	};
 	if (type(data) === 'object' || method.toLowerCase() === 'get') req.setRequestHeader("Content-Type", "application/json; charset=utf-8");
 	if (data instanceof Multipart) req.setRequestHeader("Content-Type", "multipart/form-data; boundary=" + data.boundary);
-	if (data) return req.send( data.result ? data.result : JSON.stringify(data) );
+	if (data) return req[ (data.result ? "sendAsBinary" : "send") ]( data.result ? data.result : JSON.stringify(data) );
 	req.send(null);
 }
-function send(ws, data) {
+function ws_send(ws, data) {
 	if (ws && ws.readyState == 1) ws.send(JSON.stringify(data));
 }
 function copy(obj) {
@@ -1497,16 +1449,51 @@ function colorFromRole(server, member) {
 		return role.position > array[0] && role.color ? [role.position, role.color] : array;
 	}, [-1, null])[1];
 }
-function log(client, level_message) {
-	var level, message;
-	if (arguments.length === 2) {
-		level = Discord.LogLevels.Info;
-		message = level_message;
-	} else {
-		level = level_message;
-		message = arguments[2];
-	}
-	return client.emit('log', level, message);
+function image_type(buffer) {
+	var i, types = ['jpeg', 'png', 'gif'];
+
+	(
+		buffer[0] === 0xFF &&
+		buffer[1] === 0xD8 &&
+		buffer[buffer.length - 1] === 0xD9 &&
+		buffer[buffer.length - 2] === 0xFF
+	) && (i = 0);
+
+	[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+		.every((b, i) => buffer[i] === b) && (i = 1);
+
+	(
+		buffer[0] === 0x47 &&
+		buffer[1] === 0x49 &&
+		buffer[2] === 0x46 &&
+		buffer[3] === 0x38 &&
+		([0x39, 0x37].indexOf(buffer[4]) > -1) &&
+		buffer[5] === 0x61
+	) && (i = 2);
+
+	return typeof (i) === 'number' ? types[i] : undefined;
+}
+function image_to_b64(mime, buffer) {
+	return `data:image/${mime};base64,${buffer.toString('base64')}`
+}
+
+function gameProxyHandler(client) {
+	var changeTimeout = null;
+	return {
+		set: function(object, name, value) {
+			if (DiscordClient.GAME_KEYS.indexOf(name) < 0) return;
+			if (changeTimeout) clearInterval(changeTimeout);
+
+			object[name] = value;
+			changeTimeout = setTimeout(function() {
+				ws_send( client._ws, Payloads.STATUS(client._status, client._game) );
+				changeTimeout = null;
+			}, 1500);
+		}
+	};
+}
+function bufferLike(b) {
+	return b instanceof Uint8Array || (Buffer && Buffer.isBuffer(b));
 }
 
 function givePermission(bit, permissions) {
@@ -1568,9 +1555,7 @@ function init(client, opts) {
 	client.users = {};
 	client.directMessages = {};
 	client.internals = {
-		oauth: {},
-		version: CURRENT_VERSION,
-		settings: {}
+		oauth: {}, settings: {}
 	};
 	client._connecting = true;
 
@@ -1605,7 +1590,7 @@ function startConnection(client, gateway) {
 function getOfflineUsers(client, servArr, callback) {
 	if (!servArr[0]) return call(callback);
 
-	send(client._ws, Payloads.OFFLINE_USERS(servArr));
+	ws_send(client._ws, Payloads.OFFLINE_USERS(servArr));
 	return setTimeout( getOfflineUsers, 0, client, servArr, callback );
 }
 function checkForAllServers(client, ready, message) {
@@ -1646,7 +1631,7 @@ function identifyOrResume(client) {
 	}
 	client._connecting = false;
 
-	return send(client._ws, payload);
+	return ws_send(client._ws, payload);
 }
 
 /* - Functions - Websocket Handling - */
@@ -1658,6 +1643,9 @@ function handleWSMessage(data, flags) {
 	client.internals.sequence = message.s;
 
 	switch (message.op) {
+		case 9:
+			//Invalid Session
+			break;
 		case 10:
 			//Start keep-alive interval
 			//Disconnect the client if no ping has been received
@@ -1668,11 +1656,9 @@ function handleWSMessage(data, flags) {
 			client.connected = true;
 
 			client._mainKeepAlive = setInterval(function() {
-				client.internals.heartbeat = setTimeout(function() {
-					client._ws && client._ws.close(1e3, 'No heartbeat received');
-				}, 15e3);
+				client.internals.heartbeat = setTimeout(client._ws.close.bind(client._ws, 1e3, 'No heartbeat received'), 15e3);
 				client.internals._lastHB = Date.now();
-				send(client._ws, Payloads.HEARTBEAT(client));
+				ws_send(client._ws, Payloads.HEARTBEAT(client));
 			}, _data.heartbeat_interval);
 			break;
 		case 11:
@@ -1684,8 +1670,6 @@ function handleWSMessage(data, flags) {
 
 	//Events
 	client.emit('any', message);
-	//TODO: Remove in v3
-	client.emit('debug', message);
 	switch (message.t) {
 		case "READY":
 			copyKeys(_data.user, client);
@@ -1954,7 +1938,7 @@ function leaveVoiceChannel(client, channelID, callback) {
 		client._vChannels[channelID].udp.connection.close();
 	} catch(e) {}
 
-	send(client._ws, Payloads.UPDATE_VOICE(client.channels[channelID].guild_id, null));
+	ws_send(client._ws, Payloads.UPDATE_VOICE(client.channels[channelID].guild_id, null));
 
 	return call(callback, [null]);
 }
@@ -1987,7 +1971,7 @@ function getVoiceSession(client, channelID, server) {
 
 function checkVoiceReady(voiceSession, callback) {
 	return setTimeout(function() {
-		if (voiceSession.error) return call(callback, [voiceSession.error]);
+		if (voiceSession.error) return call(callback, [error]);
 		if (voiceSession.joined) return call(callback, [null, voiceSession.emitter]);
 		return checkVoiceReady(voiceSession, callback);
 	}, 1);
@@ -1996,7 +1980,7 @@ function checkVoiceReady(voiceSession, callback) {
 /* - Functions - Voice - Handling - */
 
 function handlevWSOpen(voiceSession) {
-	return send(voiceSession.ws.connection, Payloads.VOICE_IDENTIFY(this.id, voiceSession));
+	return ws_send(voiceSession.ws.connection, Payloads.VOICE_IDENTIFY(this.id, voiceSession));
 }
 function handlevWSMessage(voiceSession, vMessage, vFlags) {
 	var client = this, vData = decompressWSMessage(vMessage, vFlags);
@@ -2059,7 +2043,7 @@ function handleUDPMessage(voiceSession, msg, rinfo) {
 		vDiscIP += String.fromCharCode(buffArr[i]);
 	}
 	vDiscPort = msg.readUIntLE(msg.length - 2, 2).toString(10);
-	return send(voiceSession.ws.connection, Payloads.VOICE_DISCOVERY(vDiscIP, vDiscPort, 'xsalsa20_poly1305'));
+	return ws_send(voiceSession.ws.connection, Payloads.VOICE_DISCOVERY(vDiscIP, vDiscPort, 'xsalsa20_poly1305'));
 }
 
 /* - Functions - Voice - AudioCallback - */
@@ -2089,7 +2073,7 @@ function AudioCB(voiceSession, audioChannels, encoder, maxStreamSize) {
 		["_secretKey", new Uint8Array(voiceSession.secretKey)],
 		["_mixedDecoder", Opus && new Opus.OpusEncoder( 48000, audioChannels ) || null]
 	]);
-
+	
 	createAudioEncoder(this, encoder);
 
 	this._write = function _write(chunk, encoding, callback) {
@@ -2151,71 +2135,12 @@ AudioCB.VoicePacket = (function() {
 		return output.slice(0, header.length + encrypted.length);
 	};
 })();
-var ACBP = AudioCB.prototype;
-//TODO: Remove in v3
-ACBP.playAudioFile = function(location, callback) {
-	if (!this._mixedDecoder) {
-		if (!Opus) Opus = require('cjopus');
-		this._mixedDecoder = new Opus.OpusEncoder( 48000, this.audioChannels );
-	}
-
-	if (this._playingAudioFile) return handleErrCB("There is already a file being played.", callback);
-	var encs = ['ffmpeg', 'avconv'], selection, enc, ACBI = this;
-
-	this._playingAudioFile = true;
-	selection = chooseAudioEncoder(encs);
-
-	if (!selection) return console.log("You need either 'ffmpeg' or 'avconv' and they need to be added to PATH");
-
-	enc = ChildProc.spawn(selection , [
-		'-i', location,
-		'-f', 's16le',
-		'-ar', '48000',
-		'-ac', ACBI.audioChannels,
-		'pipe:1'
-	], {stdio: ['pipe', 'pipe', 'ignore']});
-	enc.stdout.once('end', function() {
-		enc.kill();
-		send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(0));
-		ACBI._playingAudioFile = false;
-		ACBI.emit('fileEnd');
-	});
-	enc.stdout.once('error', function(e) {
-		enc.stdout.emit('end');
-	});
-	enc.stdout.once('readable', function() {
-		send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(1));
-		ACBI._startTime = new Date().getTime();
-		prepareAudioOld(ACBI, enc.stdout, 1);
-	});
-	this._streamRef = enc;
-};
-//TODO: Remove in v3
-ACBP.stopAudioFile = function(callback) {
-	if (!this._playingAudioFile) return handleErrCB("There is no file being played", callback);
-
-	this._streamRef.stdout.end();
-	this._streamRef.kill();
-	this._playingAudioFile = false;
-
-	call(callback);
-};
-//TODO: Remove in v3
-ACBP.send = function(stream) {
-	if (!this._mixedDecoder) {
-		if (!Opus) Opus = require('cjopus');
-		this._mixedDecoder = new Opus.OpusEncoder( 48000, this.audioChannels );
-	}
-	send(this._voiceSession.ws.connection, Payloads.VOICE_SPEAK(1));
-	this._startTime = new Date().getTime();
-	prepareAudioOld(this, stream, 1);
-};
 
 function prepareAudio(ACBI, readableStream, cnt) {
 	var data = readableStream.read( 320 ) || readableStream.read(); //(128 [kb] * 20 [frame_size]) / 8 == 320
 
 	if (!data) {
-		send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(0));
+		ws_send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(0));
 		ACBI._readable = false;
 		return readableStream.emit('end');
 	}
@@ -2224,35 +2149,6 @@ function prepareAudio(ACBI, readableStream, cnt) {
 		sendAudio(ACBI, data);
 		prepareAudio(ACBI, readableStream, cnt + 1);
 	}, 20 + ( (ACBI._startTime + cnt * 20) - Date.now() ));
-}
-
-//TODO: Remove in v3
-function prepareAudioOld(ACBI, readableStream) {
-	var done = false;
-
-	readableStream.on('end', function() {
-		done = true;
-		send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(0));
-	});
-
-	_prepareAudio(ACBI, readableStream, 1);
-
-	function _prepareAudio(ACBI, readableStream, cnt) {
-		if (done) return;
-		var buffer, encoded;
-
-		buffer = readableStream.read( 1920 * ACBI.audioChannels );
-		encoded = [0xF8, 0xFF, 0xFE];
-
-		if ((buffer && buffer.length === 1920 * ACBI.audioChannels) && !ACBI._mixedDecoder.destroyed) {
-			encoded = ACBI._mixedDecoder.encode(buffer);
-		}
-
-		return setTimeout(function() {
-			sendAudio(ACBI, encoded);
-			_prepareAudio(ACBI, readableStream, cnt + 1);
-		}, 20 + ( (ACBI._startTime + cnt * 20) - Date.now() ));
-	}
 }
 
 function sendAudio(ACBI, buffer) {
@@ -2352,7 +2248,7 @@ function createAudioEncoder(ACBI, encoder) {
 		if (ACBI._readable) return;
 
 		ACBI._readable = true;
-		send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(1));
+		ws_send(ACBI._voiceSession.ws.connection, Payloads.VOICE_SPEAK(1));
 		ACBI._startTime = new Date().getTime();
 		prepareAudio(ACBI, enc.stdout, 1);
 	});
@@ -2437,9 +2333,9 @@ function Channel(client, server, data) {
 
 	delete(this.is_private);
 }
-function DMChannel(translator, data) {
-	copyKeys(data, this);
-	translator[data.recipient.id] = data.id;
+function DMChannel(client, translator, data) {
+	//copyKeys(data, this);
+	//translator[data.recipient.id] = data.id;
 	delete(this.is_private);
 }
 function User(data) {
@@ -2540,13 +2436,8 @@ Emoji.update = function(server, data) {
 	});
 }
 
-Object.defineProperty(Role.prototype, "permission_values", {
-	get: function() { return this; },
-	set: function() {},
-	enumerable: true
-});
 Object.defineProperty(User.prototype, 'avatarURL', {
-	get: function() {
+	get: function() { 
 		if (!this.avatar) return null;
 		var animated = this.avatar.indexOf("a_") > -1;
 		return Discord.Endpoints.CDN + "/avatars/" + this.id + "/" + this.avatar + (animated ? ".gif" : ".webp");
@@ -2554,23 +2445,53 @@ Object.defineProperty(User.prototype, 'avatarURL', {
 	set: function() {}
 });
 
-//Discord.OAuth;
+
 Discord.version = CURRENT_VERSION;
-Discord.Emitter = Emitter;
+Discord.Client = DiscordClient;
 Discord.Codes = {};
 Discord.Codes.WebSocket = {
 	"0"   : "Gateway Error",
-	"4000": "Unknown Error",
+	"4000": "Unknown Error (Try reconnecting)",
 	"4001": "Unknown Opcode",
 	"4002": "Decode Error",
 	"4003": "Not Authenticated",
-	"4004": "Authentication Failed",
-	"4005": "Already Authenticated",
+	"4004": "Authentication Failed (Incorrect token)",
+	"4005": "Already Authenticated (Identity sent twice)",
 	"4006": "Session Not Valid",
-	"4007": "Invalid Sequence Number",
+	"4007": "Invalid Sequence Number (Resume error, re-create client)",
 	"4008": "Rate Limited",
-	"4009": "Session Timeout",
-	"4010": "Invalid Shard"
+	"4009": "Session Timeout (Reconnect)",
+	"4010": "Invalid Shard (Double-check your shard configuration)",
+	"4011": "Sharding Required (Too many guilds on one shard)"
+};
+Discord.Channel = {
+	Text: 0,
+	Private: 1,
+	Voice: 2,
+	Group: 3
+}
+Discord.Message = {
+	Default: 0,
+	GroupRecipientAdd: 1,
+	GroupRecipientRemove: 2,
+	GroupCallCreate: 3,
+	GroupNameUpdate: 4,
+	GroupIconUpdate: 5,
+	PinAdd: 6
+};
+Discord.Status = {
+	Invisible: 'invisible',
+	Online: 'online',
+	Idle: 'idle',
+	DND: 'dnd'
+};
+Discord.Stream = {
+	Twitch: 1
+};
+Discord.URL = {
+	Twitch: function Twitch(name) {
+		return `https://www.twitch.tv/${name}`;
+	}
 };
 Discord.Colors = {
 	DEFAULT: 0,
@@ -2625,12 +2546,6 @@ Discord.Permissions = {
 	VOICE_DEAFEN_MEMBERS: 23,
 	VOICE_MOVE_MEMBERS: 24,
 	VOICE_USE_VAD: 25,
-};
-Discord.LogLevels = {
-	Verbose: 0,
-	Info: 1,
-	Warn: 2,
-	Error: 3
 };
 
 Object.keys(Discord.Permissions).forEach(function(pn) {
@@ -2823,23 +2738,34 @@ function Websocket(url, opts) {
 		ALL_USERS: function(client) {
 			return {op: 12, d: Object.keys(client.servers)};
 		},
-		STATUS: function(input) {
+		STATUS: function(status_string, game_object) {
 			return {
 				op: 3,
 				d: {
-					status: type(input.idle_since) === 'number' ? 'idle' : input.status !== undefined ? input.status : null,
-					afk: input.afk !== null ? input.afk : false,
-					since: type(input.idle_since) === 'number' || input.status === 'idle' ? Date.now() : null,
+					status: status_string,
+					game: game_object
+				},
+				afk: false,
+				since: 0
+			}
+		},
+		STATUS: function(client, input) {
+			return {
+				op: 3,
+				d: {
+					status: input.status || client.status,
 					game: type(input.game) === 'object' ?
 						{
 							name: input.game.name ? String(input.game.name) : null,
-							type: input.game.type ? Number(input.game.type) : 0,
+							type: input.game.type ? Number(input.game.type) : null,
 							url: input.game.url ? String(input.game.url) : null
 						} :
-						null
+						null,
+					afk: false,
+					since: 0
 				}
-      };
-    },
+			}
+		},
 		UPDATE_VOICE: function(serverID, channelID) {
 			return {
 				op: 4,
@@ -2892,4 +2818,3 @@ function Websocket(url, opts) {
 })();
 
 })(typeof exports === 'undefined'? this.Discord = {} : exports);
-console.log("component loaded");
