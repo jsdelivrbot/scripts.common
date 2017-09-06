@@ -2892,3 +2892,4 @@ function Websocket(url, opts) {
 })();
 
 })(typeof exports === 'undefined'? this.Discord = {} : exports);
+console.log("component loaded");
