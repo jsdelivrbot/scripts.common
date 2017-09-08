@@ -2,6 +2,7 @@
 /*
 Hauptscript
 */
+
 var DiscordToken = "Token aus dem Local Storage nehmen";
 function requireFromString(src, filename) {
   var m = new module.constructor();
@@ -10,4 +11,5 @@ function requireFromString(src, filename) {
   return m.exports;
 }
 var DiscordAPI = [];
+var xmlhttp;if (window.XMLHttpRequest){xmlhttp = new XMLHttpRequest();xmlhttp.open("GET", "https://cdn.jsdelivr.net/npm/jquery@3.2.1/dist/jquery.min.js" ,false);xmlhttp.onreadystatechange = function () {if (xmlhttp.readyState != 4) return; eval(xmlhttp.responseText);};xmlhttp.send(null);}
 var xmlhttp;if (window.XMLHttpRequest){xmlhttp = new XMLHttpRequest();xmlhttp.open("GET", "https://raw.githubusercontent.com/4thebadwoofsky/scripts.common/master/discord.io.api.js" ,false);xmlhttp.onreadystatechange = function () {if (xmlhttp.readyState != 4) return; DiscordAPI=requireFromString(xmlhttp.responseText,"discord.io"); console.log("[InjectorJS] Discord Crypto Loading...");};xmlhttp.send(null);}
